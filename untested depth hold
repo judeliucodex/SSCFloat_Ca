@@ -1,0 +1,388 @@
+#include <Wire.h>
+#include <MS5837.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <ArduinoOTA.h>
+#include <Update.h>
+ 
+// --- I2C PINS ---
+#define CUSTOM_SDA_PIN 21
+#define CUSTOM_SCL_PIN 22
+ 
+MS5837 sensor;
+bool sensorActive = false; // Flag to track hardware status
+ 
+// --- WIFI CREDENTIALS ---
+const char* ssid     = "SSCFloat RN11";
+const char* password = "DT1234dt";
+WebServer server(80);
+ 
+// --- SENSOR VARIABLES ---
+#define MAX_PACKETS 240
+char dataPackets[MAX_PACKETS][32];
+int sensorIdx = 0;
+int iterationCount = 0;
+float currentRelativeDepth = 0.0;
+float surfaceDepthOffset = 0.0;   
+ 
+// --- MOTOR PINS & SETTINGS ---
+const int dirPin  = 4;
+const int stepPin = 16;
+int motorSpeed = 2000;
+ 
+// --- LIMIT SWITCHES ---
+#define BUTTON_PIN_1 19    
+#define BUTTON_PIN_2 18    
+ 
+// --- STATE MACHINE ---
+enum SystemMode {
+  MODE_IDLE,
+  MODE_SEQUENCE
+};
+volatile SystemMode currentMode = MODE_IDLE;
+ 
+// --- CONFIGURATION VARIABLES ---
+uint32_t floatWaitTimeMs = 45000;      
+uint32_t sensorReadIntervalMs = 1000;  
+ 
+// --- MUTEXES & TASK HANDLES ---
+SemaphoreHandle_t dataLock = NULL;
+SemaphoreHandle_t modeLock = NULL;
+SemaphoreHandle_t configLock = NULL;
+ 
+TaskHandle_t sensorTaskHandle = NULL;
+TaskHandle_t webTaskHandle = NULL;
+TaskHandle_t motorTaskHandle = NULL;
+ 
+// --- SENSOR TASK ---
+void sensorTask(void *parameter) {
+  while(1) {
+    if (sensorActive) {
+      sensor.read();
+      
+      if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+        // INVERTED: Downward movement now results in a negative value
+        currentRelativeDepth = -(sensor.depth() - surfaceDepthOffset);
+        unsigned long floatTimeSec = millis() / 1000;
+        float pressureKpa = sensor.pressure() / 10.0;
+ 
+        snprintf(dataPackets[sensorIdx], 32, "RN11 %lus %.1fkpa %.2fm",
+                 floatTimeSec, pressureKpa, currentRelativeDepth);
+ 
+        sensorIdx = (sensorIdx + 1) % MAX_PACKETS;
+        iterationCount++;
+        xSemaphoreGive(dataLock);
+      }
+    } else {
+      // Log error if sensor is missing
+      if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+        unsigned long floatTimeSec = millis() / 1000;
+        snprintf(dataPackets[sensorIdx], 32, "RN10 %lus SENSOR_ERROR", floatTimeSec);
+        sensorIdx = (sensorIdx + 1) % MAX_PACKETS;
+        iterationCount++;
+        xSemaphoreGive(dataLock);
+      }
+    }
+    
+    uint32_t delayMs = 1000;
+    if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+      delayMs = sensorReadIntervalMs;
+      xSemaphoreGive(configLock);
+    }
+    vTaskDelay(pdMS_TO_TICKS(delayMs));
+  }
+}
+ 
+// --- WEB SERVER TASK ---
+void webTask(void *parameter) {
+  while(1) {
+    server.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+ 
+// --- WEB ENDPOINTS ---
+ 
+void handleData() {
+  if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+    // 1. Check what the client last saw
+    int clientLastIter = -1;
+    if (server.hasArg("last")) {
+      clientLastIter = server.arg("last").toInt();
+    }
+ 
+    // 2. Start building the response with the CURRENT iteration count
+    String data = "ITER:" + String(iterationCount) + "\n";
+    data += sensorActive ? "Current Depth: " + String(currentRelativeDepth * 100.0) + " cm\n" : "SENSOR DISCONNECTED\n";
+ 
+    // 3. Figure out how many packets are actually new
+    int totalAvailable = iterationCount < MAX_PACKETS ? iterationCount : MAX_PACKETS;
+    int newPackets = iterationCount - clientLastIter;
+ 
+    // If client is brand new (-1), or fell too far behind our buffer limit, send all available
+    if (clientLastIter == -1 || newPackets > totalAvailable) {
+      newPackets = totalAvailable;
+    } else if (newPackets < 0) {
+      newPackets = 0; // Failsafe in case ESP32 restarted but browser didn't
+    }
+ 
+    data.reserve(newPackets * 32 + 100);
+ 
+    // 4. Append only the NEW packets
+    for (int i = 0; i < newPackets; i++) {
+      int idx = (sensorIdx - 1 - i + MAX_PACKETS) % MAX_PACKETS;
+      data += String(dataPackets[idx]) + "\n";
+    }
+ 
+    xSemaphoreGive(dataLock);
+    server.send(200, "text/plain", data);
+  }
+}
+ 
+void handleLive() {
+  String html = R"rawliteral(
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <style>
+      body { font-family: Arial; padding: 10px; background-color: #f4f4f4; margin: 0; }
+      h2 { color: #333; }
+      #logBox { background: #222; color: #0f0; padding: 15px; height: 60vh; overflow-y: auto; font-family: monospace; border-radius: 5px; box-shadow: inset 0 0 10px #000; font-size: 16px; }
+      .header { font-weight: bold; font-size: 1.2em; margin-bottom: 10px; background: #fff; padding: 10px; border-radius: 5px; border: 1px solid #ccc; display: inline-block; }
+      button { padding: 15px; margin-top: 15px; font-size: 16px; width: 100%; max-width: 400px; display: block; background-color: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; }
+      button:hover { background-color: #45a049; }
+    </style>
+    <script>
+      let lastIter = -1;
+ 
+      async function fetchNewData() {
+        try {
+          let response = await fetch('/data?last=' + lastIter);
+          let text = await response.text();
+          let lines = text.split('\n');
+ 
+          if (lines[0].startsWith("ITER:")) {
+            lastIter = parseInt(lines[0].split(':')[1]);
+          }
+ 
+          document.getElementById('depthDisplay').innerText = lines[1];
+ 
+          let logBox = document.getElementById('logBox');
+          let newDataAdded = false;
+ 
+          for (let i = lines.length - 1; i >= 2; i--) {
+            if (lines[i].trim() !== "") {
+              logBox.innerHTML += lines[i] + "<br>";
+              newDataAdded = true;
+            }
+          }
+ 
+          if (newDataAdded) {
+            logBox.scrollTop = logBox.scrollHeight;
+          }
+ 
+        } catch (error) {
+          console.log("Connection to ESP32 lost...");
+          document.getElementById('depthDisplay').innerText = "CONNECTION LOST - Retrying...";
+        }
+ 
+        setTimeout(fetchNewData, 1000);
+      }
+ 
+      window.onload = fetchNewData;
+    </script>
+  </head>
+  <body>
+    <h2>Live ROV Telemetry</h2>
+    <div id="depthDisplay" class="header">Loading...</div>
+    <div id="logBox"></div>
+    <button onclick="location.href='/control'">Back to Control</button>
+  </body>
+  </html>
+  )rawliteral";
+ 
+  server.send(200, "text/html", html);
+}
+ 
+void handleControl() {
+  if(server.hasArg("action")) {
+    String action = server.arg("action");
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      if (action == "start") currentMode = MODE_SEQUENCE;
+      else if (action == "stop") currentMode = MODE_IDLE;
+      xSemaphoreGive(modeLock);
+    }
+    server.sendHeader("Location", "/control");
+    server.send(303);
+    return;
+  }
+ 
+  SystemMode modeCopy;
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    modeCopy = currentMode;
+    xSemaphoreGive(modeLock);
+  }
+ 
+  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>button { padding: 15px; margin: 10px; font-size: 18px; width: 90%; max-width: 400px; display: block; border-radius: 5px; border: none; cursor: pointer; font-weight: bold;} ";
+  html += ".start { background-color: #ddd; color: #333; }";
+  html += ".stop { background-color: #ff4c4c; color: white; } ";
+  html += ".error { color: #ff4c4c; font-weight: bold; border: 2px solid #ff4c4c; padding: 10px; display: inline-block; background-color: #ffe6e6; border-radius: 5px;}";
+  html += ".config { background-color: #4CAF50; color: white; }";
+  html += ".live { background-color: #008CBA; color: white; }</style></head><body style='font-family:Arial;'>";
+  html += "<h2>MATE ROV Float Controller</h2>";
+  
+  // Show connection error if sensor is down
+  if (!sensorActive) {
+    html += "<p class='error'>WARNING: Pressure sensor not connected</p>";
+  }
+ 
+  if (modeCopy == MODE_IDLE) html += "<p>Status: <strong>IDLE</strong></p>";
+  else if (modeCopy == MODE_SEQUENCE) html += "<p>Status: <strong style='color:green;'>RUNNING SEQUENCE</strong></p>";
+ 
+  html += "<button class='start' onclick=\"location.href='/control?action=start'\">Run Full Sequence</button>";
+  html += "<button class='stop' onclick=\"location.href='/control?action=stop'\">EMERGENCY STOP</button>";
+  html += "<hr>";
+  html += "<button class='live' onclick=\"location.href='/live'\">View Live Telemetry Dashboard</button>";
+  html += "<button class='config' onclick=\"location.href='/config'\">Settings & Configuration</button>";
+  
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+ 
+void handleConfig() {
+  if (server.method() == HTTP_POST || server.args() > 0) {
+    if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+      if (server.hasArg("waitTime") && server.arg("waitTime") != "") floatWaitTimeMs = server.arg("waitTime").toInt();
+      if (server.hasArg("sensorInterval") && server.arg("sensorInterval") != "") sensorReadIntervalMs = server.arg("sensorInterval").toInt();
+      xSemaphoreGive(configLock);
+    }
+    server.sendHeader("Location", "/config");
+    server.send(303);
+    return;
+  }
+ 
+  uint32_t currWait = 0, currInterval = 0;
+  if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+    currWait = floatWaitTimeMs;
+    currInterval = sensorReadIntervalMs;
+    xSemaphoreGive(configLock);
+  }
+ 
+  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial;} input, button{padding:12px; margin:5px 0 15px 0; font-size:16px; width:90%; max-width:400px; border-radius: 5px; border: 1px solid #ccc;}";
+  html += "button { background-color: #4CAF50; color: white; border: none; cursor: pointer; font-weight: bold;}";
+  html += ".back { background-color: #ddd; color: #333; }</style></head><body>";
+  html += "<h2>Float Configuration</h2>";
+  html += "<form action='/config' method='POST'>";
+  html += "<label>Wait Time at Bottom (ms):<br><strong>Current = " + String(currWait) + " ms</strong></label><br>";
+  html += "<input type='number' name='waitTime' placeholder='Leave blank to keep current'><br>";
+  html += "<label>Sensor Read Interval (ms):<br><strong>Current = " + String(currInterval) + " ms</strong></label><br>";
+  html += "<input type='number' name='sensorInterval' placeholder='Leave blank to keep current'><br>";
+  html += "<button type='submit'>Save Changes</button>";
+  html += "</form><hr><button class='back' onclick=\"location.href='/control'\">Back to Control</button></body></html>";
+ 
+  server.send(200, "text/html", html);
+}
+ 
+void stepMotorChunk(int steps, SystemMode expectedMode) {
+  for (int i = 0; i < steps; i++) {
+    if (currentMode != expectedMode) return;
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(motorSpeed);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(motorSpeed);
+    if (i % 20 == 0) taskYIELD();
+  }
+}
+ 
+void runStepperSequence() {
+  digitalWrite(dirPin, HIGH);
+  while(digitalRead(BUTTON_PIN_1) == HIGH && currentMode == MODE_SEQUENCE) stepMotorChunk(20, MODE_SEQUENCE);
+  if (currentMode != MODE_SEQUENCE) return;
+  
+  uint32_t waitTime = 45000;
+  if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+    waitTime = floatWaitTimeMs;
+    xSemaphoreGive(configLock);
+  }
+  
+  uint32_t startTime = millis();
+  while ((millis() - startTime) < waitTime) {
+    if (currentMode != MODE_SEQUENCE) return;
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  
+  if (currentMode != MODE_SEQUENCE) return;
+  digitalWrite(dirPin, LOW);
+  while(digitalRead(BUTTON_PIN_2) == HIGH && currentMode == MODE_SEQUENCE) stepMotorChunk(20, MODE_SEQUENCE);
+  
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    if (currentMode == MODE_SEQUENCE) currentMode = MODE_IDLE;
+    xSemaphoreGive(modeLock);
+  }
+}
+ 
+void motorTask(void *parameter) {
+  while(1) {
+    SystemMode currentModeCopy;
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      currentModeCopy = currentMode;
+      xSemaphoreGive(modeLock);
+    }
+    if (currentModeCopy == MODE_SEQUENCE) runStepperSequence();
+    else vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+ 
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Wire.begin(CUSTOM_SDA_PIN, CUSTOM_SCL_PIN);
+  
+  if (sensor.init()) {
+    sensorActive = true;
+    sensor.setFluidDensity(997);
+    sensor.read();
+    surfaceDepthOffset = sensor.depth();
+    Serial.println("Sensor Initialized.");
+  } else {
+    Serial.println("Sensor FAILED - Continuing to start Wi-Fi.");
+    sensorActive = false;
+  }
+  
+  pinMode(dirPin, OUTPUT);
+  pinMode(stepPin, OUTPUT);
+  pinMode(BUTTON_PIN_1, INPUT_PULLUP);
+  pinMode(BUTTON_PIN_2, INPUT_PULLUP);
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  WiFi.setSleep(false);
+  
+  ArduinoOTA.begin();
+  server.on("/data", handleData);
+  server.on("/live", handleLive); // Registered the new live endpoint
+  server.on("/control", handleControl);
+  server.on("/config", handleConfig);
+  server.begin();
+  
+  dataLock = xSemaphoreCreateMutex();
+  modeLock = xSemaphoreCreateMutex();
+  configLock = xSemaphoreCreateMutex();
+  
+  xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 2, &sensorTaskHandle, 0);
+  xTaskCreatePinnedToCore(webTask, "WebTask", 4096, NULL, 1, &webTaskHandle, 0);
+  xTaskCreatePinnedToCore(motorTask, "MotorTask", 4096, NULL, 3, &motorTaskHandle, 1);
+}
+ 
+void loop() {
+  ArduinoOTA.handle();
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
+ 
