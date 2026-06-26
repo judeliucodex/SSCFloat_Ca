@@ -1,0 +1,1617 @@
+#include <Wire.h>
+#include <MS5837.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <ArduinoOTA.h>
+#include <Update.h>
+
+// ==========================================
+// --- I2C PINS & SENSOR CONFIG ---
+// ==========================================
+#define CUSTOM_SDA_PIN 21
+#define CUSTOM_SCL_PIN 22
+
+MS5837 sensor;
+volatile bool sensorActive = false;
+
+// --- Anomaly Filter Bounds ---
+const float MIN_VALID_PRESSURE = 500.0;  // hPa
+const float MAX_VALID_PRESSURE = 3000.0; // hPa
+
+// ==========================================
+// --- WIFI CREDENTIALS (AP MODE) ---
+// ==========================================
+const char* ssid     = "SSCFLOAT-RN03";     
+const char* password = "RN03DT1234"; 
+WebServer server(80);
+
+// ==========================================
+// --- TELEMETRY & DATA VARIABLES ---
+// ==========================================
+#define MAX_PACKETS 600   
+
+char dataPackets[MAX_PACKETS][64]; 
+int sensorIdx = 0;
+int iterationCount = 0;
+
+float currentRelativeDepth = 0.0;
+float surfaceDepthOffset = 0.0;
+float depthWindow[3] = {0};
+int windowIdx = 0;
+volatile uint32_t lastValidDepthMs = 0;
+
+const uint32_t SENSOR_STALE_TIMEOUT_MS = 1000;
+const uint32_t SENSOR_RETRY_INTERVAL_MS = 2000;
+
+// ==========================================
+// --- WIRELESS SERIAL LIVE LOGGER ---
+// ==========================================
+SemaphoreHandle_t logLock = NULL;
+String liveLogBuffer = "";
+
+// ==========================================
+// --- MOTOR & HARDWARE PINS ---
+// ==========================================
+const int dirPin  = 4;
+const int stepPin = 16;
+
+#define BUTTON_PIN_1 19    // Top position switch / Sinking limit
+#define BUTTON_PIN_2 18    // Bottom position switch / Floating limit
+
+// ==========================================
+// --- POSITION TRACKING ---
+// ==========================================
+long currentStepperPos = 0;
+volatile bool isHomed = false;
+
+// ==========================================
+// --- STATE MACHINE ---
+// ==========================================
+enum SystemMode {
+  MODE_IDLE,
+  MODE_HOMING,
+  MODE_MANUAL_PULSE,
+  MODE_FULL_BUMP_SEQUENCE,
+  MODE_TARGET_STEP_SEQUENCE,
+  MODE_ACTIVE_DEPTH,
+  MODE_TIMED_ACTIVE_HOLD,
+  MODE_DOUBLE_TIMED_ACTIVE_DEPTH
+};
+volatile SystemMode currentMode = MODE_IDLE;
+
+// ==========================================
+// --- STATUS & MANUAL CONTROLS ---
+// ==========================================
+volatile long holdSecondsRemaining = 0;
+String currentSubStatus = "IDLE";
+bool manualDir = true;
+uint32_t manualDurationMs = 0;
+uint32_t manualStartTime = 0;
+long targetStepPos = 0; 
+float targetDepth = 0.0;      
+float doubleActiveTarget1 = 0.0;
+float doubleActiveTarget2 = 0.0;
+uint32_t doubleActiveHoldTimeMs = 30000;
+
+// ==========================================
+// --- CONFIGURATION VARIABLES ---
+// ==========================================
+volatile int motorSpeed = 2000; 
+uint32_t floatWaitTimeMs = 30000;
+uint32_t sensorReadIntervalMs = 50;
+uint32_t sensorLogIntervalMs = 100;
+float depthToleranceCm = 3.0; 
+
+// --- PD Controller Tuning Variables ---
+float Kp = 2500.0;  // Proportional: Base number of steps per meter of error
+float Kd = 800.0;   // Derivative: Steps applied against the rate of depth change (dampening)
+uint32_t pdLoopDelayMs = 100; // Fixed dt for reliable derivative calculation
+int sinkHoldSpeed = 6000;     // PD motor speed when sinking (moving down)
+int surfaceHoldSpeed = 6000;  // PD motor speed when surfacing (moving up)
+float surfaceOutputScale = 0.5; // Scale down surfacing corrections (0-1) to prevent overshoot
+
+float targetHoldDepthCm = -40.0;  
+float doubleTargetDepth1Cm = -250.0;
+float doubleTargetDepth2Cm = -40.0;
+
+// --- Graph & Competition Settings ---
+float competitionToleranceCm = 33.0;
+int graphPollIntervalMs = 100;
+int graphWindowSeconds = 10;
+
+// ==========================================
+// --- MUTEXES & TASK HANDLES ---
+// ==========================================
+SemaphoreHandle_t dataLock = NULL;
+SemaphoreHandle_t modeLock = NULL;
+SemaphoreHandle_t configLock = NULL;
+
+TaskHandle_t sensorTaskHandle = NULL;
+TaskHandle_t webTaskHandle = NULL;
+TaskHandle_t motorTaskHandle = NULL;
+TaskHandle_t otaTaskHandle = NULL;
+
+// ==========================================
+// --- THREAD-SAFE WIRELESS LOGGING FUNCTION ---
+// ==========================================
+void safeLog(String msg) {
+  Serial.println(msg);
+  if (logLock != NULL && xSemaphoreTake(logLock, portMAX_DELAY)) {
+    liveLogBuffer += "[" + String(millis() / 1000) + "s] " + msg + "\n";
+    if (liveLogBuffer.length() > 3000) {
+      liveLogBuffer = liveLogBuffer.substring(liveLogBuffer.length() - 1500); 
+    }
+    xSemaphoreGive(logLock);
+  }
+}
+
+String systemModeName(SystemMode mode) {
+  switch (mode) {
+    case MODE_IDLE: return "IDLE";
+    case MODE_HOMING: return "HOMING";
+    case MODE_MANUAL_PULSE: return "MANUAL";
+    case MODE_FULL_BUMP_SEQUENCE: return "FULL BUMP";
+    case MODE_TARGET_STEP_SEQUENCE: return "TARGET STEP";
+    case MODE_ACTIVE_DEPTH: return "ACTIVE DEPTH";
+    case MODE_TIMED_ACTIVE_HOLD: return "TIMED ACTIVE HOLD";
+    case MODE_DOUBLE_TIMED_ACTIVE_DEPTH: return "DOUBLE TIMED ACTIVE DEPTH";
+  }
+  return "UNKNOWN";
+}
+
+bool depthReadingIsFresh(uint32_t nowMs, uint32_t lastDepthMs) {
+  return sensorActive && lastDepthMs > 0 && (nowMs - lastDepthMs) <= SENSOR_STALE_TIMEOUT_MS;
+}
+
+bool initializeSensorBaseline(String logPrefix) {
+  Wire.beginTransmission(0x76);
+  if (Wire.endTransmission() != 0 || !sensor.init()) {
+    return false;
+  }
+
+  sensor.setFluidDensity(997);
+  sensor.read();
+  float initialPressure = sensor.pressure();
+
+  if (initialPressure < MIN_VALID_PRESSURE || initialPressure > MAX_VALID_PRESSURE) {
+    safeLog(logPrefix + " Sensor found, but initial data is garbage: " + String(initialPressure) + " hPa.");
+    return false;
+  }
+
+  float baselineDepth = sensor.depth();
+  uint32_t nowMs = millis();
+
+  if (dataLock != NULL && xSemaphoreTake(dataLock, portMAX_DELAY)) {
+    surfaceDepthOffset = baselineDepth;
+    currentRelativeDepth = 0.0;
+    depthWindow[0] = 0.0;
+    depthWindow[1] = 0.0;
+    depthWindow[2] = 0.0;
+    windowIdx = 0;
+    lastValidDepthMs = nowMs;
+    xSemaphoreGive(dataLock);
+  } else {
+    surfaceDepthOffset = baselineDepth;
+    currentRelativeDepth = 0.0;
+    depthWindow[0] = 0.0;
+    depthWindow[1] = 0.0;
+    depthWindow[2] = 0.0;
+    windowIdx = 0;
+    lastValidDepthMs = nowMs;
+  }
+
+  sensorActive = true;
+  safeLog(logPrefix + " MS5837 pressure sensor baseline loaded successfully.");
+  return true;
+}
+
+// ==========================================
+// --- STEPPER HELPER FUNCTION ---
+// ==========================================
+bool singleStep(bool dirHigh, int overrideSpeedUs = -1) {
+  if (dirHigh) {
+    if (digitalRead(BUTTON_PIN_1) == LOW) return false;
+    digitalWrite(dirPin, HIGH);
+  } else {
+    if (digitalRead(BUTTON_PIN_2) == LOW) return false;
+    digitalWrite(dirPin, LOW);
+  }
+
+  digitalWrite(stepPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(stepPin, LOW);
+
+  int speedToUse = (overrideSpeedUs == -1) ? motorSpeed : overrideSpeedUs;
+  int delayMs = speedToUse / 1000;
+  
+  if (delayMs > 0) {
+    vTaskDelay(pdMS_TO_TICKS(delayMs));
+  } else {
+    delayMicroseconds(speedToUse);
+  }
+
+  if (dirHigh) currentStepperPos++;
+  else currentStepperPos--;
+  
+  return true;
+}
+
+// ==========================================
+// --- SENSOR TASK (CORE 0) ---
+// ==========================================
+void sensorTask(void *parameter) {
+  static uint32_t lastLogTime = 0;
+  static uint32_t lastSensorRetryTime = 0;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  while(1) {
+    if (sensorActive) {
+      sensor.read();
+      float currentPressure = sensor.pressure();
+
+      // --- OUTLIER REJECTION FILTER ---
+      if (currentPressure < MIN_VALID_PRESSURE || currentPressure > MAX_VALID_PRESSURE) {
+        safeLog("[SENSOR WARN] Garbage data blocked: " + String(currentPressure) + " hPa");
+      } else {
+        uint32_t logInt = 100;
+        if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+          logInt = sensorLogIntervalMs;
+          xSemaphoreGive(configLock);
+        }
+
+        if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+          float rawRelativeDepth = -(sensor.depth() - surfaceDepthOffset);
+
+          depthWindow[windowIdx] = rawRelativeDepth;
+          windowIdx = (windowIdx + 1) % 3;
+
+          float a = depthWindow[0], b = depthWindow[1], c = depthWindow[2];
+          if (a > b) { float t = a; a = b; b = t; }
+          if (a > c) { float t = a; a = c; c = t; }
+          if (b > c) { float t = b; b = c; c = t; }
+          currentRelativeDepth = b;
+          lastValidDepthMs = millis();
+
+          if (millis() - lastLogTime >= logInt) {
+            snprintf(dataPackets[sensorIdx], 64, "RN03 %lus %.1fhPa %.2fm Pos:%ld", 
+                     (millis() / 1000), 
+                     currentPressure, 
+                     currentRelativeDepth, 
+                     currentStepperPos);
+                     
+            sensorIdx = (sensorIdx + 1) % MAX_PACKETS;
+            if(iterationCount < MAX_PACKETS) iterationCount++;
+            lastLogTime = millis();
+          }
+          xSemaphoreGive(dataLock);
+        }
+      }
+    } else if (millis() - lastSensorRetryTime >= SENSOR_RETRY_INTERVAL_MS) {
+      lastSensorRetryTime = millis();
+      initializeSensorBaseline("[SENSOR RETRY]");
+    }
+
+    uint32_t delayMs = 50;
+    if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+      delayMs = sensorReadIntervalMs;
+      xSemaphoreGive(configLock);
+    }
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(delayMs));
+  }
+}
+
+// ==========================================
+// --- WEB SERVER TASK & ENDPOINTS ---
+// ==========================================
+void webTask(void *parameter) {
+  while(1) {
+    server.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void handleData() {
+  String statusCopy = "UNKNOWN";
+  long holdRemainingCopy = 0;
+  SystemMode modeCopy = MODE_IDLE;
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    statusCopy = currentSubStatus;
+    holdRemainingCopy = holdSecondsRemaining;
+    modeCopy = currentMode;
+    xSemaphoreGive(modeLock);
+  }
+
+  bool sensorActiveCopy = sensorActive;
+  float depthCopy = 0.0;
+  float targetCopy = 0.0;
+  uint32_t lastDepthCopy = 0;
+  int total = 0;
+  int startIdx = 0;
+  if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+    depthCopy = currentRelativeDepth;
+    targetCopy = targetDepth;
+    lastDepthCopy = lastValidDepthMs;
+    total = iterationCount < MAX_PACKETS ? iterationCount : MAX_PACKETS;
+    startIdx = sensorIdx;
+    xSemaphoreGive(dataLock);
+  }
+
+  String header;
+  header.reserve(320);
+  header = "Mode: " + systemModeName(modeCopy) + "\n";
+  header += "Status: " + statusCopy + " | Hold Rem: " + String(holdRemainingCopy) + "s\n";
+
+  if (!sensorActiveCopy) {
+    header += "Current Depth: -- cm (SENSOR OFFLINE)\n";
+    header += "ERROR: I2C communication with MS5837 failed. Telemetry halted.\n";
+  } else {
+    header += "Current Depth: " + String(depthCopy * 100.0) + " cm\n";
+    if (!depthReadingIsFresh(millis(), lastDepthCopy)) {
+      header += "WARNING: Depth reading is stale. Active depth hold is blocked.\n";
+    }
+    if (modeCopy == MODE_ACTIVE_DEPTH || modeCopy == MODE_TIMED_ACTIVE_HOLD || modeCopy == MODE_DOUBLE_TIMED_ACTIVE_DEPTH) {
+      header += "Target Depth: " + String(targetCopy * 100.0) + " cm\n";
+    }
+  }
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/plain", "");
+  server.sendContent(header);
+
+  if (sensorActiveCopy) {
+    char packet[64];
+    for (int i = 0; i < total; i++) {
+      int idx = (startIdx - 1 - i + MAX_PACKETS) % MAX_PACKETS;
+      if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+        snprintf(packet, sizeof(packet), "%s", dataPackets[idx]);
+        xSemaphoreGive(dataLock);
+        server.sendContent(String(packet) + "\n");
+      }
+    }
+  }
+  server.sendContent("");
+}
+
+void handleLidaPage() {
+  int pollMs = 100;
+  int winSec = 10;
+  if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+    pollMs = graphPollIntervalMs;
+    winSec = graphWindowSeconds;
+    xSemaphoreGive(configLock);
+  }
+  if (pollMs < 10) pollMs = 10;
+  if (winSec < 1) winSec = 1;
+
+  String html;
+  html.reserve(9200);
+  html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Float Depth Graph</title>";
+  html += "<style>";
+  html += "body{font-family:'Courier New',monospace;background:#121212;color:#ccc;padding:12px;margin:0;}";
+  html += "h2{margin:0 0 4px 0;color:#fff;font-family:Arial,sans-serif;font-size:18px;}";
+  html += "#status{margin-bottom:8px;font-size:13px;color:#aaa;}";
+  html += "canvas{display:block;width:100%;background:#000;border:2px solid #333;border-radius:8px;}";
+  html += "</style></head><body>";
+  html += "<h2>Float Depth Monitor</h2>";
+  html += "<div id='status'>Connecting...</div>";
+  html += "<canvas id='chart'></canvas>";
+  html += "<pre id='log' style='background:#000;border:1px solid #333;border-radius:4px;padding:8px;height:35vh;overflow-y:scroll;margin-top:8px;font-family:Courier New,monospace;font-size:10px;color:#aaa;white-space:pre;line-height:1.4'>Awaiting data...</pre>";
+
+  html += "<script>";
+  html += "const POLL_MS=" + String(pollMs) + ";const WIN_MS=" + String(winSec) + "*1000;";
+  html += "const MODES=['IDLE','HOMING','MANUAL','FULL BUMP','TARGET STEP','ACTIVE DEPTH','TIMED ACTIVE HOLD','DOUBLE TIMED ACTIVE DEPTH'];";
+  html += "let pts=[];";
+  html += "const cv=document.getElementById('chart');const cx=cv.getContext('2d');";
+  html += "function rz(){const r=cv.parentElement.getBoundingClientRect();cv.width=r.width-4;cv.height=500;}";
+  html += "window.addEventListener('resize',rz);rz();";
+  html += "function dr(){";
+  html += "const W=cv.width,H=cv.height,ml=55,mr=15,mt=10,mb=40,pw=W-ml-mr,ph=H-mt-mb;";
+  html += "cx.fillStyle='#000';cx.fillRect(0,0,W,H);";
+  html += "if(pts.length<2){return;}";
+  html += "const t0=pts[0].t,tN=pts[pts.length-1].t;if(tN===t0)return;";
+  html += "let y0=Infinity,y1=-Infinity;";
+  html += "pts.forEach(p=>{";
+  html += "if(p.depth_cm<y0)y0=p.depth_cm;if(p.depth_cm>y1)y1=p.depth_cm;";
+  html += "if(p.target_cm!==null){";
+  html += "if(p.target_cm-p.tolerance_cm<y0)y0=p.target_cm-p.tolerance_cm;";
+  html += "if(p.target_cm+p.tolerance_cm>y1)y1=p.target_cm+p.tolerance_cm;}";
+  html += "});";
+  html += "const yp=(y1-y0)*0.1||10;y0-=yp;y1+=yp;";
+  html += "function X(t){return ml+((t-t0)/(tN-t0))*pw;}";
+  html += "function Y(v){return mt+ph-((v-y0)/(y1-y0))*ph;}";
+
+  html += "cx.strokeStyle='#2a2a2a';cx.lineWidth=0.5;";
+  html += "for(let i=1;i<5;i++){";
+  html += "const yy=mt+(ph/5)*i;cx.beginPath();cx.moveTo(ml,yy);cx.lineTo(ml+pw,yy);cx.stroke();";
+  html += "const xx=ml+(pw/5)*i;cx.beginPath();cx.moveTo(xx,mt);cx.lineTo(xx,mt+ph);cx.stroke();}";
+  html += "cx.strokeStyle='#555';cx.lineWidth=1;";
+  html += "for(let i=0;i<=5;i++){";
+  html += "const yy=mt+(ph/5)*i;cx.beginPath();cx.moveTo(ml-6,yy);cx.lineTo(ml,yy);cx.stroke();";
+  html += "const xx=ml+(pw/5)*i;cx.beginPath();cx.moveTo(xx,mt+ph);cx.lineTo(xx,mt+ph+6);cx.stroke();}";
+
+  html += "if(y0<=0&&y1>=0){cx.strokeStyle='#555';cx.setLineDash([4,4]);";
+  html += "cx.beginPath();cx.moveTo(ml,Y(0));cx.lineTo(ml+pw,Y(0));cx.stroke();cx.setLineDash([]);}";
+
+  html += "cx.strokeStyle='#ff8800';cx.setLineDash([3,6]);cx.lineWidth=1;";
+  html += "cx.beginPath();let st=false;";
+  html += "pts.forEach(p=>{if(p.target_cm!==null){const y=Y(p.target_cm+p.tolerance_cm);";
+  html += "if(!st){cx.moveTo(X(p.t),y);st=true;}else cx.lineTo(X(p.t),y);}});";
+  html += "cx.stroke();";
+  html += "cx.beginPath();st=false;";
+  html += "pts.forEach(p=>{if(p.target_cm!==null){const y=Y(p.target_cm-p.tolerance_cm);";
+  html += "if(!st){cx.moveTo(X(p.t),y);st=true;}else cx.lineTo(X(p.t),y);}});";
+  html += "cx.stroke();cx.setLineDash([]);";
+
+  html += "let ht=false;pts.forEach(p=>{if(p.target_cm!==null)ht=true;});";
+  html += "if(ht){cx.strokeStyle='#ffaa00';cx.setLineDash([5,3]);cx.lineWidth=2;";
+  html += "cx.beginPath();st=false;";
+  html += "pts.forEach(p=>{if(p.target_cm!==null){";
+  html += "if(!st){cx.moveTo(X(p.t),Y(p.target_cm));st=true;}else cx.lineTo(X(p.t),Y(p.target_cm));}});";
+  html += "cx.stroke();cx.setLineDash([]);}";
+
+  html += "cx.strokeStyle='#00e5ff';cx.lineWidth=2;";
+  html += "cx.beginPath();pts.forEach((p,i)=>{";
+  html += "if(i===0)cx.moveTo(X(p.t),Y(p.depth_cm));else cx.lineTo(X(p.t),Y(p.depth_cm));});";
+  html += "cx.stroke();";
+
+  html += "cx.font='10px Arial,sans-serif';cx.textAlign='right';";
+  html += "let ly=mt+16;";
+  html += "cx.fillStyle='#00e5ff';cx.fillText('Actual',ml+pw-2,ly);ly+=18;";
+  html += "cx.fillStyle='#ffaa00';cx.fillText('Target',ml+pw-2,ly);ly+=18;";
+  html += "cx.fillStyle='#ff8800';cx.fillText('Tol \u00b1',ml+pw-2,ly);";
+
+  html += "cx.strokeStyle='#888';cx.lineWidth=1;cx.setLineDash([]);";
+  html += "cx.beginPath();cx.moveTo(ml,mt);cx.lineTo(ml,mt+ph);cx.stroke();";
+  html += "cx.beginPath();cx.moveTo(ml,mt+ph);cx.lineTo(ml+pw,mt+ph);cx.stroke();";
+
+  html += "cx.fillStyle='#aaa';cx.font='10px Arial,sans-serif';cx.textAlign='right';";
+  html += "for(let i=0;i<=5;i++){const v=y0+((y1-y0)/5)*(5-i);";
+  html += "cx.fillText(v.toFixed(0),ml-8,mt+(ph/5)*i+4);}";
+
+  html += "cx.textAlign='center';cx.font='10px Arial,sans-serif';cx.fillStyle='#aaa';";
+  html += "for(let i=0;i<=5;i++){const s=((tN-t0)/1000/5)*i;";
+  html += "cx.fillText(s.toFixed(1),ml+(pw/5)*i,mt+ph+16);}";
+  html += "cx.fillStyle='#888';cx.fillText('Time (s)',ml+pw/2,mt+ph+34);";
+
+  html += "cx.save();cx.translate(14,mt+ph/2);cx.rotate(-Math.PI/2);";
+  html += "cx.textAlign='center';cx.font='10px Arial,sans-serif';cx.fillStyle='#888';";
+  html += "cx.fillText('Depth (cm)',0,0);cx.restore();";
+
+  html += "const l=pts[pts.length-1];";
+  html += "document.getElementById('status').innerHTML='Mode: '+MODES[l.mode]+";
+  html += "' | Depth: '+l.depth_cm.toFixed(1)+' cm'+";
+  html += "(l.target_cm!==null?' | Target: '+l.target_cm.toFixed(1)+' cm \u00b1'+l.tolerance_cm.toFixed(0):'');";
+  html += "ul();";
+
+  html += "}";
+
+  html += "function pl(){";
+  html += "fetch('/lidadata').then(r=>r.json()).then(d=>{";
+  html += "pts.push(d);const cut=d.t-WIN_MS;pts=pts.filter(p=>p.t>=cut);dr();";
+  html += "}).catch(()=>{});}";
+
+  html += "function ul(){";
+  html += "if(pts.length===0)return;";
+  html += "const t0=pts[0].t;let s='';";
+  html += "pts.forEach(p=>{s+=((p.t-t0)/1000).toFixed(1)+'s  '+p.depth_cm.toFixed(1)+'cm\\n';});";
+  html += "const el=document.getElementById('log');el.textContent=s;el.scrollTop=el.scrollHeight;}";
+
+  html += "setInterval(pl," + String(pollMs) + ");pl();";
+  html += "</script></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handleLivePage() {
+  String html;
+  html.reserve(1800);
+  html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Float Live Serial Terminal</title>";
+  html += "<style>body{font-family:'Courier New',monospace; background:#121212; color:#00ff66; padding:20px; margin:0;} ";
+  html += "#terminal{background:#000000; border:2px solid #333; border-radius:8px; padding:15px; height:82vh; overflow-y:scroll; white-space:pre-wrap; box-shadow: inset 0 0 10px #00ff6633;} ";
+  html += "h2{margin-top:0; color:#ffffff; font-family:Arial,sans-serif;}</style></head>";
+  html += "<body><h2>MATE ROV Wireless Serial Terminal</h2>";
+  html += "<div id='terminal'>Awaiting data feed connection...</div>";
+  html += "<script>";
+  html += "function updateOutput(){";
+  html += "  fetch('/livedata').then(response=>response.text()).then(text=>{";
+  html += "    let term=document.getElementById('terminal');";
+  html += "    term.innerText=text;";
+  html += "    term.scrollTop=term.scrollHeight; ";
+  html += "  });";
+  html += "}";
+  html += "setInterval(updateOutput, 500); ";
+  html += "updateOutput();";
+  html += "</script></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleLiveData() {
+  if (xSemaphoreTake(logLock, portMAX_DELAY)) {
+    server.send(200, "text/plain", liveLogBuffer);
+    xSemaphoreGive(logLock);
+  } else {
+    server.send(500, "text/plain", "Log system busy");
+  }
+}
+
+void handleLidaData() {
+  String json = "{";
+  json.reserve(180);
+
+  if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+    json += "\"depth_cm\":" + String(currentRelativeDepth * 100.0, 1) + ",";
+    xSemaphoreGive(dataLock);
+  } else {
+    json += "\"depth_cm\":0,";
+  }
+
+  SystemMode modeCopy = MODE_IDLE;
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    modeCopy = currentMode;
+    xSemaphoreGive(modeLock);
+  }
+
+  json += "\"mode\":" + String(modeCopy) + ",";
+
+  if (modeCopy == MODE_ACTIVE_DEPTH || modeCopy == MODE_TIMED_ACTIVE_HOLD || modeCopy == MODE_DOUBLE_TIMED_ACTIVE_DEPTH) {
+    if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+      json += "\"target_cm\":" + String(targetDepth * 100.0, 1) + ",";
+      xSemaphoreGive(dataLock);
+    }
+  } else {
+    json += "\"target_cm\":null,";
+  }
+
+  float tolCm = 33.0;
+  if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+    tolCm = competitionToleranceCm;
+    xSemaphoreGive(configLock);
+  }
+  json += "\"tolerance_cm\":" + String(tolCm, 1) + ",";
+
+  json += "\"t\":" + String(millis()) + "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleControl() {
+  if(server.hasArg("action")) {
+    String action = server.arg("action");
+    if (action == "doubletimedactivedepth") {
+      bool homedCopy = false;
+      if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+        homedCopy = isHomed;
+        xSemaphoreGive(modeLock);
+      }
+
+      if (homedCopy) {
+        float target1Cm = -250.0;
+        float target2Cm = -40.0;
+        uint32_t holdTimeMs = 30000;
+        if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+          target1Cm = doubleTargetDepth1Cm;
+          target2Cm = doubleTargetDepth2Cm;
+          holdTimeMs = floatWaitTimeMs;
+          xSemaphoreGive(configLock);
+        }
+
+        float target1Meters = 0.0;
+        float target2Meters = 0.0;
+        uint32_t lastDepthMs = 0;
+        bool depthFresh = false;
+        uint32_t nowMs = millis();
+        if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+          lastDepthMs = lastValidDepthMs;
+          depthFresh = depthReadingIsFresh(nowMs, lastDepthMs);
+          if (depthFresh) {
+            float sequenceStartDepth = currentRelativeDepth;
+            target1Meters = sequenceStartDepth + (target1Cm / 100.0);
+            target2Meters = sequenceStartDepth + (target2Cm / 100.0);
+            targetDepth = target1Meters;
+          }
+          xSemaphoreGive(dataLock);
+        }
+
+        if (depthFresh) {
+          if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+            if (isHomed) {
+              doubleActiveTarget1 = target1Meters;
+              doubleActiveTarget2 = target2Meters;
+              doubleActiveHoldTimeMs = holdTimeMs;
+              currentMode = MODE_DOUBLE_TIMED_ACTIVE_DEPTH;
+              currentSubStatus = "SEEKING DEPTH 1";
+              holdSecondsRemaining = 0;
+              safeLog("[SEQUENCE] Double timed active depth started. Target 1: " + String(target1Meters * 100.0) + "cm, Target 2: " + String(target2Meters * 100.0) + "cm.");
+            }
+            xSemaphoreGive(modeLock);
+          }
+        } else {
+          uint32_t ageMs = lastDepthMs > 0 ? (millis() - lastDepthMs) : 0;
+          safeLog("[ACTIVE ERROR] Cannot start double timed active depth: pressure sensor data is offline or stale (age " + String(ageMs) + "ms).");
+        }
+      }
+
+      server.sendHeader("Location", "/control");
+      server.send(303);
+      return;
+    }
+
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      if (action == "stop") {
+        currentMode = MODE_IDLE;
+        currentSubStatus = "IDLE";
+        holdSecondsRemaining = 0;
+        safeLog("[E-STOP] Emergency Stop triggered by user!");
+      } 
+      else if (action == "home") {
+        currentMode = MODE_HOMING;
+        isHomed = false;
+        currentSubStatus = "HOMING";
+        holdSecondsRemaining = 0;
+        safeLog("[SYSTEM] Initiating syringe homing procedure...");
+      } 
+      else if (action == "manual") {
+        manualDir = (server.arg("dir") == "down");
+        manualDurationMs = server.arg("time").toInt() * 1000;
+        manualStartTime = millis();
+        currentMode = MODE_MANUAL_PULSE;
+        currentSubStatus = "MANUAL";
+        holdSecondsRemaining = 0;
+        safeLog("[MANUAL] Pulsing motor. Direction: " + String(manualDir ? "DOWN" : "UP"));
+      } 
+      else if (action == "targetstep" && isHomed) {
+        targetStepPos = server.arg("steps").toInt();
+        currentMode = MODE_TARGET_STEP_SEQUENCE;
+        holdSecondsRemaining = 0;
+        safeLog("[SEQUENCE] Starting Target Step sequence. Absolute Target: " + String(targetStepPos));
+      }
+      else if (action == "fullbump" && isHomed) {
+        currentMode = MODE_FULL_BUMP_SEQUENCE;
+        holdSecondsRemaining = 0;
+        safeLog("[SEQUENCE] Starting Full Bump sequence.");
+      } 
+      else if ((action == "activedepth" || action == "timedactivehold") && isHomed) {
+        bool timedMode = action == "timedactivehold";
+        float holdTargetCm = -40.0;
+        float newTargetDepth = 0.0;
+        uint32_t lastDepthMs = 0;
+        bool depthFresh = false;
+        
+        if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+          holdTargetCm = targetHoldDepthCm;
+          xSemaphoreGive(configLock);
+        }
+        
+        if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+          lastDepthMs = lastValidDepthMs;
+          depthFresh = depthReadingIsFresh(millis(), lastDepthMs);
+          if (depthFresh) {
+            targetDepth = currentRelativeDepth + (holdTargetCm / 100.0);
+            newTargetDepth = targetDepth;
+          }
+          xSemaphoreGive(dataLock);
+        }
+
+        if (depthFresh) {
+          currentMode = timedMode ? MODE_TIMED_ACTIVE_HOLD : MODE_ACTIVE_DEPTH;
+          if (timedMode) currentSubStatus = "SEEKING TIMED HOLD";
+          holdSecondsRemaining = 0;
+          safeLog(String("[SEQUENCE] ") + (timedMode ? "Timed active hold" : "PD active hold") + " started. Target: " + String(newTargetDepth * 100.0) + "cm.");
+        } else {
+          uint32_t ageMs = lastDepthMs > 0 ? (millis() - lastDepthMs) : 0;
+          safeLog("[ACTIVE ERROR] Cannot start PD hold: pressure sensor data is offline or stale (age " + String(ageMs) + "ms).");
+        }
+      }
+      xSemaphoreGive(modeLock);
+    }
+    server.sendHeader("Location", "/control");
+    server.send(303);
+    return;
+  }
+
+  SystemMode modeCopy = MODE_IDLE;
+  bool isHomedCopy = false;
+  String statusCopy = "IDLE";
+  long holdRemainingCopy = 0;
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    modeCopy = currentMode;
+    isHomedCopy = isHomed;
+    statusCopy = currentSubStatus;
+    holdRemainingCopy = holdSecondsRemaining;
+    xSemaphoreGive(modeLock);
+  }
+  
+  float currentHoldDisplay = -40.0;
+  if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+    currentHoldDisplay = targetHoldDepthCm;
+    xSemaphoreGive(configLock);
+  }
+
+  String html;
+  html.reserve(7000);
+  html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial; text-align:center;} button { padding: 15px; margin: 10px auto; font-size: 18px; width: 90%; max-width: 400px; display: block; border-radius: 5px; border: none; cursor: pointer; font-weight: bold;} ";
+  html += "input, select { padding:12px; margin:5px auto; font-size:16px; width:90%; max-width:400px; display: block; border-radius: 5px; border: 1px solid #ccc; box-sizing: border-box; }";
+  html += ".stop { background-color: #ff4c4c; color: white; } .manual { background-color: #333; color: white; } .config { background-color: #4CAF50; color: white; }";
+  html += "</style></head><body><h2>MATE ROV Float Controller</h2>";
+
+  if (modeCopy == MODE_FULL_BUMP_SEQUENCE || modeCopy == MODE_TARGET_STEP_SEQUENCE || modeCopy == MODE_ACTIVE_DEPTH || modeCopy == MODE_TIMED_ACTIVE_HOLD || modeCopy == MODE_DOUBLE_TIMED_ACTIVE_DEPTH) {
+    html += "<div style='padding:15px; background:#e3f2fd; border:2px solid #2196f3; border-radius:10px; margin:10px auto; width:90%; max-width:400px;'>";
+    html += "Phase: <strong style='color:#9c27b0;'>" + statusCopy + "</strong><br>";
+    if (statusCopy == "HOLDING" || statusCopy == "ACTIVE HOLD (PD)" || statusCopy == "TIMED HOLD (PD)" || statusCopy == "HOLDING DEPTH 1 (PD)" || statusCopy == "HOLDING DEPTH 2 (PD)") {
+      html += "<span style='font-size:2em; color:#2e7d32;'><strong>" + String(holdRemainingCopy) + "s</strong> Left</span>";
+    }
+    html += "</div>";
+  } else {
+    html += "<p>Status: <strong>" + String(modeCopy == MODE_IDLE ? "IDLE" : (modeCopy == MODE_HOMING ? "HOMING" : "MANUAL")) + "</strong></p>";
+  }
+
+  html += "<button class='stop' onclick=\"location.href='/control?action=stop'\">EMERGENCY STOP</button>";
+  html += "<button class='config' style='background-color:#008CBA;' onclick=\"location.href='/control?action=home'\">RE-HOME SYRINGES</button>";
+
+  html += "<hr><h3>Manual Motor Recovery</h3><form action='/control' method='GET'><input type='hidden' name='action' value='manual'>";
+  html += "<select name='dir'><option value='up'>UP (Float)</option><option value='down'>DOWN (Sink)</option></select>";
+  html += "<input type='number' name='time' placeholder='Seconds' required><button type='submit' class='manual'>GO</button></form>";
+
+  html += "<hr><h3>Run To Target Step (Absolute)</h3><form action='/control' method='GET'><input type='hidden' name='action' value='targetstep'>";
+  html += "<input type='number' name='steps' placeholder='Target Absolute Step (e.g. 15000)' required min='0'>";
+  if (isHomedCopy) html += "<button type='submit' class='manual' style='background-color:#673ab7;'>Run to Step</button></form>";
+  else html += "<button type='button' class='manual' style='background:#ccc' disabled>Home First</button></form>";
+
+  html += "<hr><h3>Automated Sequences</h3>";
+  
+  html += "<form action='/control' method='GET'><input type='hidden' name='action' value='activedepth'>";
+  if (isHomedCopy) html += "<button type='submit' class='manual' style='background-color:#e91e63;'>Run PD Active Hold (Target " + String(currentHoldDisplay) + "cm)</button></form>";
+  else html += "<button type='button' class='manual' style='background:#ccc' disabled>Home First</button></form>";
+
+  html += "<form action='/control' method='GET'><input type='hidden' name='action' value='timedactivehold'>";
+  if (isHomedCopy) html += "<button type='submit' class='manual' style='background-color:#3f51b5;'>Timed active hold</button></form>";
+  else html += "<button type='button' class='manual' style='background:#ccc' disabled>Home First</button></form>";
+
+  html += "<form action='/control' method='GET'><input type='hidden' name='action' value='doubletimedactivedepth'>";
+  if (isHomedCopy) html += "<button type='submit' class='manual' style='background-color:#00695c;'>Double timed active depth</button></form>";
+  else html += "<button type='button' class='manual' style='background:#ccc' disabled>Home First</button></form>";
+  
+  html += "<form action='/control' method='GET'><input type='hidden' name='action' value='fullbump'>";
+  if (isHomedCopy) html += "<button type='submit' class='manual' style='background-color:#009688;'>Run Full Bump Sequence</button></form>";
+  else html += "<button type='button' class='manual' style='background:#ccc' disabled>Home First</button></form>";
+
+  html += "<hr><button class='config' onclick=\"location.href='/config'\">Settings</button>";
+  html += "<br><br><button class='manual' style='background-color:#00ff66; color:black;' onclick=\"window.open('/live')\">OPEN LIVE WIRELESS TERMINAL</button>";
+  html += "</body></html>"; 
+  
+  server.send(200, "text/html", html);
+}
+
+void handleConfig() {
+  if (server.method() == HTTP_POST || server.args() > 0) {
+    if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+      if (server.hasArg("waitTime")) floatWaitTimeMs = server.arg("waitTime").toInt();
+      if (server.hasArg("tolerance")) depthToleranceCm = server.arg("tolerance").toFloat();
+      if (server.hasArg("readInterval")) sensorReadIntervalMs = server.arg("readInterval").toInt();
+      if (server.hasArg("logInterval")) sensorLogIntervalMs = server.arg("logInterval").toInt();
+      if (server.hasArg("motorDelay")) motorSpeed = server.arg("motorDelay").toInt(); 
+      if (server.hasArg("holdDrop")) targetHoldDepthCm = server.arg("holdDrop").toFloat();
+      if (server.hasArg("doubleDepth1")) doubleTargetDepth1Cm = server.arg("doubleDepth1").toFloat();
+      if (server.hasArg("doubleDepth2")) doubleTargetDepth2Cm = server.arg("doubleDepth2").toFloat();
+
+      // PD Tuning
+      if (server.hasArg("Kp")) Kp = server.arg("Kp").toFloat();
+      if (server.hasArg("Kd")) Kd = server.arg("Kd").toFloat();
+      if (server.hasArg("pdDt")) pdLoopDelayMs = server.arg("pdDt").toInt();
+      if (server.hasArg("sinkDelay")) sinkHoldSpeed = server.arg("sinkDelay").toInt();
+      if (server.hasArg("surfDelay")) surfaceHoldSpeed = server.arg("surfDelay").toInt();
+      if (server.hasArg("surfScale")) surfaceOutputScale = server.arg("surfScale").toFloat();
+      if (server.hasArg("compTol")) competitionToleranceCm = server.arg("compTol").toFloat();
+      if (server.hasArg("gPollMs")) graphPollIntervalMs = server.arg("gPollMs").toInt();
+      if (server.hasArg("gWinSec")) graphWindowSeconds = server.arg("gWinSec").toInt();
+
+      xSemaphoreGive(configLock);
+    }
+    server.sendHeader("Location", "/config");
+    server.send(303);
+    return;
+  }
+
+  String html;
+  html.reserve(6800);
+  html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial; padding: 20px;} input { padding:10px; margin:5px 0 15px 0; width:100%; max-width:300px; display:block; } button { padding: 12px 20px; font-size: 16px; background-color: #4CAF50; color: white; border: none; cursor: pointer; } h3 { margin-top: 30px; border-bottom: 1px solid #ccc; padding-bottom: 5px; color:#333; }</style></head>";
+  html += "<body><h2>System Settings</h2><form action='/config' method='POST'>";
+
+  html += "<h3>Global Settings</h3>";
+  html += "<label>Motor Step Delay (us/ms): <small>(Global Speed)</small></label>";
+  html += "<input type='number' name='motorDelay' value='"+String(motorSpeed)+"'>";
+  html += "<label>Total Sequence Hold Time (ms):</label><input type='number' name='waitTime' value='"+String(floatWaitTimeMs)+"'>";
+  html += "<label>Depth Tolerance (cm): <small>(Deadband)</small></label><input type='number' step='0.1' name='tolerance' value='"+String(depthToleranceCm)+"'>";
+
+  html += "<h3>Active Hold: Target Depth</h3>";
+  html += "<label>Target Hold Depth (cm):</label><input type='number' step='0.1' name='holdDrop' value='"+String(targetHoldDepthCm)+"'>";
+
+  html += "<h3>Double Timed Active Depth</h3>";
+  html += "<label>Target Depth 1 (cm):</label><input type='number' step='0.1' name='doubleDepth1' value='"+String(doubleTargetDepth1Cm)+"'>";
+  html += "<label>Target Depth 2 (cm):</label><input type='number' step='0.1' name='doubleDepth2' value='"+String(doubleTargetDepth2Cm)+"'>";
+
+  html += "<div style='background:#fff3e0; padding:15px; border-radius:8px; border: 2px solid #ff9800; margin-top: 20px;'>";
+  html += "<h3 style='margin-top:0; color:#e65100;'>PD Controller Tuning</h3>";
+  html += "<label>Proportional (Kp): <small>(Correction aggressiveness)</small></label>";
+  html += "<input type='number' step='0.1' name='Kp' value='"+String(Kp)+"'>";
+  html += "<label>Derivative (Kd): <small>(Dampening / overshoot prevention)</small></label>";
+  html += "<input type='number' step='0.1' name='Kd' value='"+String(Kd)+"'>";
+  html += "<label>Loop Period (ms): <small>(Fixed dt for derivative)</small></label>";
+  html += "<input type='number' name='pdDt' value='"+String(pdLoopDelayMs)+"'>";
+  html += "<label>Sink Motor Speed (us/ms): <small>(PD step speed when sinking)</small></label>";
+  html += "<input type='number' name='sinkDelay' value='"+String(sinkHoldSpeed)+"'>";
+  html += "<label>Surface Motor Speed (us/ms): <small>(PD step speed when surfacing)</small></label>";
+  html += "<input type='number' name='surfDelay' value='"+String(surfaceHoldSpeed)+"'>";
+  html += "<label>Surface Correction Strength: <small>(Scale surfacing output, 0-1. Lower = gentler reversal)</small></label>";
+  html += "<input type='number' step='0.1' min='0' max='1' name='surfScale' value='"+String(surfaceOutputScale)+"'>";
+  html += "</div>";
+
+  html += "<h3>Telemetry</h3>";
+  html += "<label>Sensor Read Interval (ms):</label><input type='number' name='readInterval' value='"+String(sensorReadIntervalMs)+"'>";
+  html += "<label>Data Log Interval (ms):</label><input type='number' name='logInterval' value='"+String(sensorLogIntervalMs)+"'>";
+
+  html += "<h3>Graph &amp; Competition</h3>";
+  html += "<label>Competition Tolerance (&plusmn;cm):</label><input type='number' step='0.1' name='compTol' value='"+String(competitionToleranceCm)+"'>";
+  html += "<label>Graph Poll Interval (ms):</label><input type='number' name='gPollMs' value='"+String(graphPollIntervalMs)+"'>";
+  html += "<label>Graph Time Window (seconds):</label><input type='number' name='gWinSec' value='"+String(graphWindowSeconds)+"'>";
+
+  html += "<br><button type='submit' style='width:100%; max-width:600px;'>Save Settings</button></form></body></html>";
+  server.send(200, "text/html", html);
+}
+
+// ==========================================
+// --- MOTOR BEHAVIORS & SEQUENCES ---
+// ==========================================
+void surfaceEmergency() {
+  safeLog("[SAFETY] Surfacing active. Driving upward to limit switch...");
+  while(digitalRead(BUTTON_PIN_2) == HIGH && currentMode != MODE_HOMING && currentMode != MODE_IDLE) {
+    singleStep(false); 
+    vTaskDelay(1);
+  }
+  if (digitalRead(BUTTON_PIN_2) == LOW) {
+    safeLog("[SAFETY] Upper limit switch triggered successfully.");
+  }
+}
+
+void executeHoldAndSurface(SystemMode expectedMode, String logPrefix) {
+  if (currentMode == expectedMode) {
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      currentSubStatus = "HOLDING";
+      xSemaphoreGive(modeLock);
+    }
+    safeLog("[" + logPrefix + " STATUS] Target reached. Holding.");
+    uint32_t holdTimeMs = 30000;
+    
+    if (xSemaphoreTake(configLock, portMAX_DELAY)) {
+      holdTimeMs = floatWaitTimeMs;
+      xSemaphoreGive(configLock);
+    }
+
+    uint32_t startHold = millis();
+    while (millis() - startHold < holdTimeMs && currentMode == expectedMode) {
+      long remainingSeconds = (holdTimeMs / 1000) - ((millis() - startHold) / 1000);
+      if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+        holdSecondsRemaining = remainingSeconds;
+        xSemaphoreGive(modeLock);
+      }
+      vTaskDelay(100);
+    }
+  }
+
+  if (currentMode == expectedMode) {
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      currentSubStatus = "SURFACING";
+      holdSecondsRemaining = 0;
+      xSemaphoreGive(modeLock);
+    }
+    surfaceEmergency();
+  }
+  
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    currentSubStatus = "IDLE";
+    holdSecondsRemaining = 0;
+    currentMode = MODE_IDLE;
+    xSemaphoreGive(modeLock);
+  }
+  safeLog("[" + logPrefix + " STATUS] Sequence complete. System IDLE.");
+}
+
+void runTargetStepSequence() {
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    currentSubStatus = "MOVING";
+    holdSecondsRemaining = 0;
+    xSemaphoreGive(modeLock);
+  }
+  safeLog("[STEP STATUS] Phase changed to: MOVING to step " + String(targetStepPos));
+
+  while (currentMode == MODE_TARGET_STEP_SEQUENCE && currentStepperPos != targetStepPos) {
+    bool dirDown = (targetStepPos > currentStepperPos); 
+    
+    if (dirDown && digitalRead(BUTTON_PIN_1) == LOW) {
+      safeLog("[WARNING] Bottom limit hit before reaching target step!");
+      break;
+    }
+    if (!dirDown && digitalRead(BUTTON_PIN_2) == LOW) {
+      safeLog("[WARNING] Top limit hit before reaching target step!");
+      break;
+    }
+    singleStep(dirDown);
+  }
+
+  executeHoldAndSurface(MODE_TARGET_STEP_SEQUENCE, "STEP");
+}
+
+void runFullBumpSequence() {
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    currentSubStatus = "SINKING (BUMP)";
+    holdSecondsRemaining = 0;
+    xSemaphoreGive(modeLock);
+  }
+  safeLog("[BUMP STATUS] Phase changed to: SINKING");
+
+  while (currentMode == MODE_FULL_BUMP_SEQUENCE) {
+    if (digitalRead(BUTTON_PIN_1) == LOW) {
+      safeLog("[BUMP STATUS] Limit switch reached. Sinking complete.");
+      break;
+    }
+    singleStep(true);
+  }
+
+  executeHoldAndSurface(MODE_FULL_BUMP_SEQUENCE, "BUMP");
+}
+
+void runActiveDepthSequence() {
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    currentSubStatus = "ACTIVE HOLD (PD)";
+    holdSecondsRemaining = 0;
+    xSemaphoreGive(modeLock);
+  }
+  safeLog("[ACTIVE STATUS] PD active hold engaged. Target: " + String(targetDepth * 100.0) + "cm.");
+
+  float toleranceMeters = 0.03;
+  float currentKp = 2500.0, currentKd = 800.0;
+  int s_speed = 6000, u_speed = 6000;
+  uint32_t dtMs = 100;
+  float surfScale = 0.5;
+
+  if (xSemaphoreTake(configLock, pdMS_TO_TICKS(50))) {
+    toleranceMeters = depthToleranceCm / 100.0; 
+    currentKp = Kp;
+    currentKd = Kd;
+    s_speed = sinkHoldSpeed;
+    u_speed = surfaceHoldSpeed;
+    dtMs = pdLoopDelayMs;
+    surfScale = surfaceOutputScale;
+    xSemaphoreGive(configLock);
+  }
+
+  float lastError = 0.0;
+  bool correctionActive = false;
+  uint32_t lastLoopTime = 0;
+  bool firstIteration = true;
+
+  while (currentMode == MODE_ACTIVE_DEPTH) {
+    uint32_t loopStart = millis();
+
+    float currentDepth = 0.0;
+    uint32_t lastDepthMs = 0;
+    bool depthFresh = false;
+    if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+      currentDepth = currentRelativeDepth;
+      lastDepthMs = lastValidDepthMs;
+      depthFresh = depthReadingIsFresh(loopStart, lastDepthMs);
+      xSemaphoreGive(dataLock);
+    }
+
+    if (!depthFresh) {
+      uint32_t ageMs = lastDepthMs > 0 ? (loopStart - lastDepthMs) : 0;
+      safeLog("[ACTIVE ERROR] Pressure sensor data stale during PD hold (age " + String(ageMs) + "ms). Surfacing.");
+      surfaceEmergency();
+      break;
+    }
+
+    float error = currentDepth - targetDepth;
+
+    float actualDtSec;
+    if (firstIteration) {
+      actualDtSec = dtMs / 1000.0f;
+      firstIteration = false;
+    } else {
+      actualDtSec = (loopStart - lastLoopTime) / 1000.0f;
+      if (actualDtSec < 0.001f) actualDtSec = 0.001f;
+    }
+    lastLoopTime = loopStart;
+
+    float derivative = (error - lastError) / actualDtSec;
+    lastError = error;
+
+    float output = (currentKp * error) + (currentKd * derivative);
+    if (output < 0) output *= surfScale;
+
+    if (!correctionActive) {
+      if (fabs(error) > toleranceMeters) correctionActive = true;
+    } else {
+      if (fabs(error) < toleranceMeters * 0.7f) correctionActive = false;
+    }
+
+    if (correctionActive) {
+      int stepsToTake = abs((int)output);
+      if (stepsToTake > 500) stepsToTake = 500;
+
+      if (output > 0) {
+        bool limitHit = false;
+        for (int i = 0; i < stepsToTake && currentMode == MODE_ACTIVE_DEPTH; i++) {
+          if (!singleStep(true, s_speed)) { limitHit = true; break; }
+        }
+        if (limitHit && digitalRead(BUTTON_PIN_1) == LOW) {
+          safeLog("[SAFETY] Bottom limit hit during PD — emergency surfacing!");
+          surfaceEmergency();
+          break;
+        }
+      } else if (output < 0) {
+        for (int i = 0; i < stepsToTake && currentMode == MODE_ACTIVE_DEPTH; i++) {
+          if (!singleStep(false, u_speed)) break; 
+        }
+      }
+    }
+
+    uint32_t elapsed = millis() - loopStart;
+    if (elapsed < dtMs) {
+      vTaskDelay(pdMS_TO_TICKS(dtMs - elapsed));
+    }
+  }
+
+  if (currentMode == MODE_ACTIVE_DEPTH) {
+    safeLog("[ACTIVE STATUS] PD hold terminated. System IDLE.");
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      currentSubStatus = "IDLE";
+      holdSecondsRemaining = 0;
+      currentMode = MODE_IDLE;
+      xSemaphoreGive(modeLock);
+    }
+  }
+}
+
+void runTimedActiveHoldSequence() {
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    currentSubStatus = "SEEKING TIMED HOLD";
+    holdSecondsRemaining = 0;
+    xSemaphoreGive(modeLock);
+  }
+  safeLog("[TIMED ACTIVE] Timed active hold engaged. Target: " + String(targetDepth * 100.0) + "cm.");
+
+  float toleranceMeters = 0.03;
+  float currentKp = 2500.0, currentKd = 800.0;
+  int s_speed = 6000, u_speed = 6000;
+  uint32_t dtMs = 100;
+  uint32_t holdTimeMs = 30000;
+  float surfScale = 0.5;
+
+  if (xSemaphoreTake(configLock, pdMS_TO_TICKS(50))) {
+    toleranceMeters = depthToleranceCm / 100.0;
+    currentKp = Kp;
+    currentKd = Kd;
+    s_speed = sinkHoldSpeed;
+    u_speed = surfaceHoldSpeed;
+    dtMs = pdLoopDelayMs;
+    holdTimeMs = floatWaitTimeMs;
+    surfScale = surfaceOutputScale;
+    xSemaphoreGive(configLock);
+  }
+
+  float lastError = 0.0;
+  bool correctionActive = false;
+  uint32_t lastLoopTime = 0;
+  bool firstIteration = true;
+  bool holdTimerStarted = false;
+  uint32_t holdStartMs = 0;
+
+  while (currentMode == MODE_TIMED_ACTIVE_HOLD) {
+    uint32_t loopStart = millis();
+
+    float currentDepth = 0.0;
+    uint32_t lastDepthMs = 0;
+    bool depthFresh = false;
+    if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+      currentDepth = currentRelativeDepth;
+      lastDepthMs = lastValidDepthMs;
+      depthFresh = depthReadingIsFresh(loopStart, lastDepthMs);
+      xSemaphoreGive(dataLock);
+    }
+
+    if (!depthFresh) {
+      uint32_t ageMs = lastDepthMs > 0 ? (loopStart - lastDepthMs) : 0;
+      safeLog("[TIMED ACTIVE ERROR] Pressure sensor data stale during timed hold (age " + String(ageMs) + "ms). Surfacing.");
+      break;
+    }
+
+    float error = currentDepth - targetDepth;
+
+    if (!holdTimerStarted && fabs(error) <= toleranceMeters) {
+      holdTimerStarted = true;
+      holdStartMs = loopStart;
+      if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+        currentSubStatus = "TIMED HOLD (PD)";
+        holdSecondsRemaining = holdTimeMs / 1000;
+        xSemaphoreGive(modeLock);
+      }
+      safeLog("[TIMED ACTIVE] Target deadband reached. Hold timer started.");
+    }
+
+    if (holdTimerStarted) {
+      uint32_t elapsedHoldMs = loopStart - holdStartMs;
+      long remainingSeconds = 0;
+      if (elapsedHoldMs < holdTimeMs) {
+        remainingSeconds = (holdTimeMs - elapsedHoldMs + 999) / 1000;
+      }
+
+      if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+        holdSecondsRemaining = remainingSeconds;
+        xSemaphoreGive(modeLock);
+      }
+
+      if (elapsedHoldMs >= holdTimeMs) {
+        safeLog("[TIMED ACTIVE] Hold time complete. Surfacing.");
+        break;
+      }
+    }
+
+    float actualDtSec;
+    if (firstIteration) {
+      actualDtSec = dtMs / 1000.0f;
+      firstIteration = false;
+    } else {
+      actualDtSec = (loopStart - lastLoopTime) / 1000.0f;
+      if (actualDtSec < 0.001f) actualDtSec = 0.001f;
+    }
+    lastLoopTime = loopStart;
+
+    float derivative = (error - lastError) / actualDtSec;
+    lastError = error;
+
+    float output = (currentKp * error) + (currentKd * derivative);
+    if (output < 0) output *= surfScale;
+
+    if (!correctionActive) {
+      if (fabs(error) > toleranceMeters) correctionActive = true;
+    } else {
+      if (fabs(error) < toleranceMeters * 0.7f) correctionActive = false;
+    }
+
+    if (correctionActive) {
+      int stepsToTake = abs((int)output);
+      if (stepsToTake > 500) stepsToTake = 500;
+
+      if (output > 0) {
+        bool limitHit = false;
+        for (int i = 0; i < stepsToTake && currentMode == MODE_TIMED_ACTIVE_HOLD; i++) {
+          if (!singleStep(true, s_speed)) { limitHit = true; break; }
+        }
+        if (limitHit && digitalRead(BUTTON_PIN_1) == LOW) {
+          safeLog("[SAFETY] Bottom limit hit during timed PD hold. Surfacing.");
+          break;
+        }
+      } else if (output < 0) {
+        for (int i = 0; i < stepsToTake && currentMode == MODE_TIMED_ACTIVE_HOLD; i++) {
+          if (!singleStep(false, u_speed)) break;
+        }
+      }
+    }
+
+    uint32_t elapsed = millis() - loopStart;
+    if (elapsed < dtMs) {
+      vTaskDelay(pdMS_TO_TICKS(dtMs - elapsed));
+    }
+  }
+
+  if (currentMode == MODE_TIMED_ACTIVE_HOLD) {
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      currentSubStatus = "SURFACING";
+      holdSecondsRemaining = 0;
+      xSemaphoreGive(modeLock);
+    }
+
+    surfaceEmergency();
+
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      currentSubStatus = "IDLE";
+      holdSecondsRemaining = 0;
+      currentMode = MODE_IDLE;
+      xSemaphoreGive(modeLock);
+    }
+    safeLog("[TIMED ACTIVE] Timed active hold complete. System IDLE.");
+  }
+}
+
+bool runDoubleTimedActiveStage(SystemMode expectedMode,
+                               float stageTargetDepth,
+                               const char* seekingStatus,
+                               const char* holdingStatus,
+                               const char* stageLabel,
+                               const char* completionLog,
+                               uint32_t holdTimeMs,
+                               float toleranceMeters,
+                               float currentKp,
+                               float currentKd,
+                               int s_speed,
+                               int u_speed,
+                               uint32_t dtMs,
+                               float surfScale) {
+  if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+    targetDepth = stageTargetDepth;
+    xSemaphoreGive(dataLock);
+  }
+
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    currentSubStatus = seekingStatus;
+    holdSecondsRemaining = 0;
+    xSemaphoreGive(modeLock);
+  }
+
+  safeLog(String("[DOUBLE ACTIVE] Seeking ") + stageLabel + ". Target: " + String(stageTargetDepth * 100.0) + "cm.");
+
+  float lastError = 0.0;
+  bool correctionActive = false;
+  uint32_t lastLoopTime = 0;
+  bool firstIteration = true;
+  bool holdTimerStarted = false;
+  uint32_t holdStartMs = 0;
+
+  while (currentMode == expectedMode) {
+    uint32_t loopStart = millis();
+
+    float currentDepth = 0.0;
+    uint32_t lastDepthMs = 0;
+    bool depthFresh = false;
+    if (xSemaphoreTake(dataLock, portMAX_DELAY)) {
+      currentDepth = currentRelativeDepth;
+      lastDepthMs = lastValidDepthMs;
+      depthFresh = depthReadingIsFresh(loopStart, lastDepthMs);
+      xSemaphoreGive(dataLock);
+    }
+
+    if (!depthFresh) {
+      uint32_t ageMs = lastDepthMs > 0 ? (loopStart - lastDepthMs) : 0;
+      safeLog("[DOUBLE ACTIVE ERROR] Pressure sensor data stale during double timed active depth (age " + String(ageMs) + "ms). Surfacing.");
+      return false;
+    }
+
+    float error = currentDepth - stageTargetDepth;
+
+    if (!holdTimerStarted && fabs(error) <= toleranceMeters) {
+      holdTimerStarted = true;
+      holdStartMs = loopStart;
+      if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+        currentSubStatus = holdingStatus;
+        holdSecondsRemaining = holdTimeMs / 1000;
+        xSemaphoreGive(modeLock);
+      }
+      safeLog(String("[DOUBLE ACTIVE] Target ") + stageLabel + " deadband reached. Hold timer started.");
+    }
+
+    if (holdTimerStarted) {
+      uint32_t elapsedHoldMs = loopStart - holdStartMs;
+      long remainingSeconds = 0;
+      if (elapsedHoldMs < holdTimeMs) {
+        remainingSeconds = (holdTimeMs - elapsedHoldMs + 999) / 1000;
+      }
+
+      if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+        holdSecondsRemaining = remainingSeconds;
+        xSemaphoreGive(modeLock);
+      }
+
+      if (elapsedHoldMs >= holdTimeMs) {
+        safeLog(String("[DOUBLE ACTIVE] ") + completionLog);
+        return true;
+      }
+    }
+
+    float actualDtSec;
+    if (firstIteration) {
+      actualDtSec = dtMs / 1000.0f;
+      firstIteration = false;
+    } else {
+      actualDtSec = (loopStart - lastLoopTime) / 1000.0f;
+      if (actualDtSec < 0.001f) actualDtSec = 0.001f;
+    }
+    lastLoopTime = loopStart;
+
+    float derivative = (error - lastError) / actualDtSec;
+    lastError = error;
+
+    float output = (currentKp * error) + (currentKd * derivative);
+    if (output < 0) output *= surfScale;
+
+    if (!correctionActive) {
+      if (fabs(error) > toleranceMeters) correctionActive = true;
+    } else {
+      if (fabs(error) < toleranceMeters * 0.7f) correctionActive = false;
+    }
+
+    if (correctionActive) {
+      int stepsToTake = abs((int)output);
+      if (stepsToTake > 500) stepsToTake = 500;
+
+      if (output > 0) {
+        bool limitHit = false;
+        for (int i = 0; i < stepsToTake && currentMode == expectedMode; i++) {
+          if (!singleStep(true, s_speed)) { limitHit = true; break; }
+        }
+        if (limitHit && digitalRead(BUTTON_PIN_1) == LOW) {
+          safeLog("[SAFETY] Bottom limit hit during double timed active depth. Surfacing.");
+          return false;
+        }
+      } else if (output < 0) {
+        for (int i = 0; i < stepsToTake && currentMode == expectedMode; i++) {
+          if (!singleStep(false, u_speed)) break;
+        }
+      }
+    }
+
+    uint32_t elapsed = millis() - loopStart;
+    if (elapsed < dtMs) {
+      vTaskDelay(pdMS_TO_TICKS(dtMs - elapsed));
+    }
+  }
+
+  return false;
+}
+
+void runDoubleTimedActiveDepthSequence() {
+  float stage1Target = 0.0;
+  float stage2Target = 0.0;
+  uint32_t holdTimeMs = 30000;
+  if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+    stage1Target = doubleActiveTarget1;
+    stage2Target = doubleActiveTarget2;
+    holdTimeMs = doubleActiveHoldTimeMs;
+    currentSubStatus = "SEEKING DEPTH 1";
+    holdSecondsRemaining = 0;
+    xSemaphoreGive(modeLock);
+  }
+
+  safeLog("[DOUBLE ACTIVE] Started. Target 1: " + String(stage1Target * 100.0) + "cm, Target 2: " + String(stage2Target * 100.0) + "cm.");
+
+  float toleranceMeters = 0.03;
+  float currentKp = 2500.0, currentKd = 800.0;
+  int s_speed = 6000, u_speed = 6000;
+  uint32_t dtMs = 100;
+  float surfScale = 0.5;
+
+  if (xSemaphoreTake(configLock, pdMS_TO_TICKS(50))) {
+    toleranceMeters = depthToleranceCm / 100.0;
+    currentKp = Kp;
+    currentKd = Kd;
+    s_speed = sinkHoldSpeed;
+    u_speed = surfaceHoldSpeed;
+    dtMs = pdLoopDelayMs;
+    surfScale = surfaceOutputScale;
+    xSemaphoreGive(configLock);
+  }
+
+  bool stage1Done = runDoubleTimedActiveStage(MODE_DOUBLE_TIMED_ACTIVE_DEPTH,
+                                              stage1Target,
+                                              "SEEKING DEPTH 1",
+                                              "HOLDING DEPTH 1 (PD)",
+                                              "depth 1",
+                                              "Target depth 1 hold complete.",
+                                              holdTimeMs,
+                                              toleranceMeters,
+                                              currentKp,
+                                              currentKd,
+                                              s_speed,
+                                              u_speed,
+                                              dtMs,
+                                              surfScale);
+
+  if (stage1Done && currentMode == MODE_DOUBLE_TIMED_ACTIVE_DEPTH) {
+    runDoubleTimedActiveStage(MODE_DOUBLE_TIMED_ACTIVE_DEPTH,
+                              stage2Target,
+                              "SEEKING DEPTH 2",
+                              "HOLDING DEPTH 2 (PD)",
+                              "depth 2",
+                              "Target depth 2 hold complete. Surfacing.",
+                              holdTimeMs,
+                              toleranceMeters,
+                              currentKp,
+                              currentKd,
+                              s_speed,
+                              u_speed,
+                              dtMs,
+                              surfScale);
+  }
+
+  if (currentMode == MODE_DOUBLE_TIMED_ACTIVE_DEPTH) {
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      currentSubStatus = "SURFACING";
+      holdSecondsRemaining = 0;
+      xSemaphoreGive(modeLock);
+    }
+
+    surfaceEmergency();
+
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      currentSubStatus = "IDLE";
+      holdSecondsRemaining = 0;
+      currentMode = MODE_IDLE;
+      xSemaphoreGive(modeLock);
+    }
+    safeLog("[DOUBLE ACTIVE] Sequence complete. System IDLE.");
+  }
+}
+
+// ==========================================
+// --- MAIN MOTOR TASK (CORE 1) ---
+// ==========================================
+void motorTask(void *parameter) {
+  while(1) {
+    SystemMode m;
+    if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+      m = currentMode;
+      xSemaphoreGive(modeLock);
+    }
+
+    if (m == MODE_HOMING) {
+      while(digitalRead(BUTTON_PIN_2) == HIGH && currentMode == MODE_HOMING) {
+        singleStep(false);
+        vTaskDelay(1);
+      }
+      bool homedNow = false;
+      if (currentMode == MODE_HOMING) {
+        currentStepperPos = 0;
+        homedNow = true;
+        safeLog("[SYSTEM] Home reference set to 0 steps.");
+      }
+      
+      if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+        if (homedNow) isHomed = true;
+        currentSubStatus = "IDLE";
+        holdSecondsRemaining = 0;
+        currentMode = MODE_IDLE;
+        xSemaphoreGive(modeLock);
+      }
+    }
+    else if (m == MODE_MANUAL_PULSE) {
+      while(millis() - manualStartTime < manualDurationMs) {
+        if (!singleStep(manualDir) || currentMode != MODE_MANUAL_PULSE) break;
+        vTaskDelay(1);
+      }
+      
+      if (xSemaphoreTake(modeLock, portMAX_DELAY)) {
+        currentSubStatus = "IDLE";
+        holdSecondsRemaining = 0;
+        currentMode = MODE_IDLE;
+        xSemaphoreGive(modeLock);
+      }
+    }
+    else if (m == MODE_TARGET_STEP_SEQUENCE) { 
+      runTargetStepSequence();
+    }
+    else if (m == MODE_FULL_BUMP_SEQUENCE) {
+      runFullBumpSequence();
+    }
+    else if (m == MODE_ACTIVE_DEPTH) {
+      runActiveDepthSequence();
+    }
+    else if (m == MODE_TIMED_ACTIVE_HOLD) {
+      runTimedActiveHoldSequence();
+    }
+    else if (m == MODE_DOUBLE_TIMED_ACTIVE_DEPTH) {
+      runDoubleTimedActiveDepthSequence();
+    }
+    else {
+      vTaskDelay(100);
+    }
+  }
+}
+
+// ==========================================
+// --- DEDICATED OTA & DISCOVERY TASK (CORE 0) ---
+// ==========================================
+void otaTask(void *parameter) {
+  while(1) {
+    ArduinoOTA.handle();
+    vTaskDelay(pdMS_TO_TICKS(10)); 
+  }
+}
+
+// ==========================================
+// --- SETUP & LOOP ---
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Wire.begin(CUSTOM_SDA_PIN, CUSTOM_SCL_PIN);
+
+  logLock = xSemaphoreCreateMutex();
+  liveLogBuffer.reserve(3000);
+  safeLog("[BOOT] System initialization started...");
+
+  unsigned long start = millis();
+  while (millis() - start < 5000) {
+    if (initializeSensorBaseline("[BOOT]")) break;
+    delay(250);
+  }
+
+  if (!sensorActive) {
+    safeLog("[BOOT ERROR] MS5837 failed to initialize or baseline was unstable!");
+  }
+
+  pinMode(dirPin, OUTPUT);
+  pinMode(stepPin, OUTPUT);
+  pinMode(BUTTON_PIN_1, INPUT_PULLUP);
+  pinMode(BUTTON_PIN_2, INPUT_PULLUP);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  delay(500); 
+
+  safeLog("[NET] Access Point started successfully!");
+  safeLog("[NET] Network Name: " + String(ssid));
+  safeLog("[NET] AP IP Address: " + WiFi.softAPIP().toString());
+
+  if (MDNS.begin("sscfloat")) {
+    safeLog("[NET] mDNS domain initialized: http://sscfloat.local");
+    MDNS.addService("arduino", "tcp", 3232);
+    MDNS.addService("http", "tcp", 80);
+  }
+
+  ArduinoOTA.begin();
+  
+  server.on("/data", handleData);
+  server.on("/control", handleControl);
+  server.on("/config", handleConfig);
+  server.on("/live", handleLivePage);        
+  server.on("/livedata", handleLiveData);   
+  server.on("/lidata", handleLidaPage);
+  server.on("/lidadata", handleLidaData);
+  server.begin();
+
+  dataLock = xSemaphoreCreateMutex();
+  modeLock = xSemaphoreCreateMutex();
+  configLock = xSemaphoreCreateMutex();
+
+  if (logLock == NULL || dataLock == NULL || modeLock == NULL || configLock == NULL) {
+    safeLog("[BOOT FATAL] Mutex creation failed. FreeRTOS tasks not started.");
+    return;
+  }
+
+  bool tasksOk = true;
+  if (xTaskCreatePinnedToCore(sensorTask, "Sens", 4096, NULL, 2, &sensorTaskHandle, 0) != pdPASS) {
+    safeLog("[BOOT FATAL] Failed to start sensor task.");
+    tasksOk = false;
+  }
+  if (xTaskCreatePinnedToCore(webTask, "Web", 4096, NULL, 1, &webTaskHandle, 0) != pdPASS) {
+    safeLog("[BOOT FATAL] Failed to start web task.");
+    tasksOk = false;
+  }
+  if (xTaskCreatePinnedToCore(otaTask, "OTA", 4096, NULL, 3, &otaTaskHandle, 0) != pdPASS) {
+    safeLog("[BOOT FATAL] Failed to start OTA task.");
+    tasksOk = false;
+  }
+  if (xTaskCreatePinnedToCore(motorTask, "Mot", 4096, NULL, 3, &motorTaskHandle, 1) != pdPASS) {
+    safeLog("[BOOT FATAL] Failed to start motor task.");
+    tasksOk = false;
+  }
+
+  if (!tasksOk) {
+    safeLog("[BOOT FATAL] One or more FreeRTOS tasks failed to start.");
+    return;
+  }
+  
+  safeLog("[BOOT] FreeRTOS task schedules active. Float engine ready.");
+}
+
+void loop() {
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
