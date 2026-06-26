@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MATE ROV Float Depth Plotter</title>
+    <style>
+        body {
+            background-color: #000000;
+            color: #ffffff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            margin: 0;
+        }
+
+        h1 {
+            font-size: 22px;
+            margin-bottom: 20px;
+            color: #00ff00;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 900px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        textarea {
+            width: 100%;
+            background-color: #111;
+            color: #ffffff;
+            border: 1px solid #ffffff;
+            padding: 12px;
+            font-family: 'Courier New', monospace;
+            resize: vertical;
+            box-sizing: border-box;
+            outline: none;
+        }
+
+        .config-group {
+            display: flex;
+            gap: 20px;
+            background-color: #111;
+            padding: 10px;
+            border: 1px solid #ffffff;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .config-group label {
+            font-size: 14px;
+            font-weight: bold;
+        }
+
+        .config-group input {
+            background-color: #000000;
+            color: #00ff00;
+            border: 1px solid #00ff00;
+            padding: 5px;
+            width: 70px;
+            font-family: inherit;
+            font-weight: bold;
+            text-align: center;
+            outline: none;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 10px;
+        }
+
+        button {
+            flex: 1;
+            border: none;
+            padding: 14px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        #goBtn {
+            background-color: #00ff00;
+            color: #000000;
+        }
+
+        #downloadBtn {
+            background-color: #ffffff;
+            color: #000000;
+        }
+
+        button:hover {
+            opacity: 0.8;
+        }
+
+        canvas {
+            background-color: #000000;
+            border: 1px solid #ffffff;
+            margin-top: 20px;
+            width: 100%;
+            max-width: 900px;
+            height: auto; 
+        }
+    </style>
+</head>
+<body>
+
+    <h1 id="graphTitle">Float Depth Graph</h1>
+
+    <div class="container">
+        <textarea id="dataInput" rows="8" placeholder="Paste data here..."></textarea>
+        
+        <div class="config-group">
+            <label>Time Interval (s): 
+                <input type="number" id="xInterval" value="5" min="1" step="1">
+            </label>
+            <label>Depth Interval (m): 
+                <input type="number" id="yInterval" value="0.1" min="0.01" step="0.01">
+            </label>
+        </div>
+
+        <div class="button-group">
+            <button id="goBtn" onclick="processData()">GO</button>
+            <button id="downloadBtn" onclick="downloadGraph()">DOWNLOAD IMAGE</button>
+        </div>
+    </div>
+
+    <canvas id="graphCanvas" width="1000" height="900"></canvas>
+
+    <script>
+        let currentFloatName = "ROV";
+
+        function processData() {
+            const rawData = document.getElementById('dataInput').value;
+            const lines = rawData.trim().split('\n');
+            
+            let parsedData = [];
+
+            for (let line of lines) {
+                line = line.trim();
+                if (!line) continue;
+                
+                const parts = line.split(/\s+/);
+                if (parts.length >= 4) {
+                    currentFloatName = parts[0];
+                    let time = parseFloat(parts[1].replace('s', ''));
+                    let depth = parseFloat(parts[3].replace('m', ''));
+                    
+                    if (!isNaN(time) && !isNaN(depth)) {
+                        parsedData.push({ time, depth });
+                    }
+                }
+            }
+
+            if (parsedData.length === 0) return;
+            parsedData.sort((a, b) => a.time - b.time);
+            
+            // Update the UI title above the input box
+            document.getElementById('graphTitle').innerText = `${currentFloatName} float pressure graph`;
+            
+            // Draw the graph (now including the title on canvas)
+            drawGraph(parsedData);
+        }
+
+        function drawGraph(data) {
+            const canvas = document.getElementById('graphCanvas');
+            const ctx = canvas.getContext('2d');
+            const width = canvas.width;
+            const height = canvas.height;
+            
+            // Standard padding for graph elements
+            const padLeft = 100;
+            const padBottom = 80;
+            const padTop = 80; // Increased slightly for title room
+            const padRight = 60;
+
+            // Fetch interval settings
+            let xInt = parseFloat(document.getElementById('xInterval').value) || 5;
+            let yInt = parseFloat(document.getElementById('yInterval').value) || 0.1;
+            if (xInt <= 0) xInt = 5;
+            if (yInt <= 0) yInt = 0.1;
+
+            // --- Clear Canvas to Black ---
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, width, height);
+
+            // --- DRAW TITLE DIRECTLY ON CANVAS (So it's on PNG) ---
+            const canvasTitleText = `${currentFloatName} float pressure graph`;
+            ctx.fillStyle = '#00ff00'; // Match UI header color
+            ctx.font = 'bold 24px Arial';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            // Placed at the top center of the image, 20px down.
+            ctx.fillText(canvasTitleText, width / 2, 20);
+
+            // --- Calc Bounds ---
+            const minTime = Math.min(...data.map(d => d.time));
+            const maxTime = Math.max(...data.map(d => d.time));
+            const minDepth = Math.min(...data.map(d => d.depth));
+            const maxDepth = Math.max(...data.map(d => d.depth));
+
+            const scaleX = (width - padLeft - padRight) / (maxTime - minTime || 1);
+            const scaleY = (height - padTop - padBottom) / (maxDepth - minDepth || 1);
+
+            const getX = (t) => padLeft + (t - minTime) * scaleX;
+            const getY = (d) => height - padBottom - (d - minDepth) * scaleY;
+
+            // --- AXES ---
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(padLeft, padTop);
+            ctx.lineTo(padLeft, height - padBottom);
+            ctx.lineTo(width - padRight, height - padBottom);
+            ctx.stroke();
+
+            // --- Axis Label Styles ---
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 16px Arial';
+
+            // Y-Axis Label
+            ctx.save();
+            ctx.translate(30, (padTop + (height - padBottom)) / 2); // Vertically centered to the plotting area
+            ctx.rotate(-Math.PI / 2);
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText("Depth (m)", 0, 0);
+            ctx.restore();
+
+            // X-Axis Label
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText("Time (s)", width / 2, height - 20);
+
+            // --- Index Styles ---
+            ctx.font = '14px Arial';
+            ctx.textBaseline = 'middle'; // Reset baseline for numbers
+
+            // --- X-AXIS INDEXING ---
+            ctx.textAlign = 'center';
+            // Draw exact Min/Max time first
+            ctx.fillText(Math.round(minTime) + "s", getX(minTime), height - padBottom + 25);
+            ctx.fillText(Math.round(maxTime) + "s", getX(maxTime), height - padBottom + 25);
+
+            // Draw custom intervals for Time
+            let startX = Math.ceil(minTime / xInt) * xInt;
+            for (let t = startX; t <= maxTime; t += xInt) {
+                // Skip if custom interval overlaps with the exact min/max bounds
+                if (Math.abs(getX(t) - getX(minTime)) < 25 || Math.abs(getX(t) - getX(maxTime)) < 25) continue;
+                
+                let xPos = getX(t);
+                ctx.fillText(t + "s", xPos, height - padBottom + 25);
+                ctx.beginPath();
+                ctx.moveTo(xPos, height - padBottom);
+                ctx.lineTo(xPos, height - padBottom + 8);
+                ctx.stroke();
+            }
+
+            // --- Y-AXIS INDEXING ---
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'middle';
+            
+            // Draw exact Min/Max depth first
+            ctx.fillText(minDepth.toFixed(2) + "m", padLeft - 15, getY(minDepth));
+            ctx.fillText(maxDepth.toFixed(2) + "m", padLeft - 15, getY(maxDepth));
+
+            // Draw custom intervals for Depth
+            let startY = Math.ceil(minDepth / yInt) * yInt;
+            let safeMaxDepth = maxDepth + (yInt * 0.01); // Floating point safety
+            for (let d = startY; d <= safeMaxDepth; d += yInt) {
+                // Skip if custom interval overlaps with exact min/max bounds
+                if (Math.abs(getY(d) - getY(minDepth)) < 20 || Math.abs(getY(d) - getY(maxDepth)) < 20) continue;
+                
+                let yPos = getY(d);
+                ctx.fillText(d.toFixed(2) + "m", padLeft - 15, yPos);
+                ctx.beginPath();
+                ctx.moveTo(padLeft, yPos);
+                ctx.lineTo(padLeft - 8, yPos);
+                ctx.stroke();
+            }
+
+            // --- PLOT LINE ---
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            data.forEach((point, i) => {
+                let x = getX(point.time);
+                let y = getY(point.depth);
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+
+            // --- PLOT DOTS ---
+            ctx.fillStyle = '#00ff00';
+            data.forEach(point => {
+                ctx.beginPath();
+                ctx.arc(getX(point.time), getY(point.depth), 4, 0, Math.PI * 2);
+                ctx.fill();
+            });
+        }
+
+        function downloadGraph() {
+            const canvas = document.getElementById('graphCanvas');
+            const link = document.createElement('a');
+            // The title is already drawn on the canvas now, we just save it.
+            link.download = `${currentFloatName}_Depth_Graph.png`;
+            link.href = canvas.toDataURL('image/png');
+            link.click();
+        }
+    </script>
+</body>
+</html>
