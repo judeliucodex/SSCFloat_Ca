@@ -277,9 +277,9 @@ void sensorTask(void *parameter) {
           lastValidDepthMs = millis();
 
           if (millis() - lastLogTime >= logInt) {
-            snprintf(dataPackets[sensorIdx], 64, "RN03 %lus %.1fhPa %.2fm Pos:%ld", 
+            snprintf(dataPackets[sensorIdx], 64, "RN03 %lus %.2fkPa %.2fm Pos:%ld", 
                      (millis() / 1000), 
-                     currentPressure, 
+                     currentPressure / 10.0, 
                      currentRelativeDepth, 
                      currentStepperPos);
                      
